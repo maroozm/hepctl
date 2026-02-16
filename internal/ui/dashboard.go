@@ -694,7 +694,8 @@ func (m dashboardModel) renderVersionPicker(_ int) string {
 		}
 		badge := ""
 		if ver.IsLatest {
-			badge = " " + latestBadge.Render("latest")
+			recommended := lipgloss.NewStyle().Foreground(lipgloss.Color("#7DCEA0")).Render(" (recommended)")
+			badge = " " + latestBadge.Render("latest") + recommended
 		}
 
 		if idx == m.versionCursor {
