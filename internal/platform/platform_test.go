@@ -155,3 +155,36 @@ ID_LIKE="ubuntu debian"
 		t.Fatal("expected debian match via ID_LIKE")
 	}
 }
+
+func TestParseDistroID(t *testing.T) {
+	content := `NAME="Ubuntu"
+VERSION="22.04.3 LTS (Jammy Jellyfish)"
+ID=ubuntu
+ID_LIKE=debian
+`
+	if got := parseDistroID(content); got != "ubuntu" {
+		t.Errorf("expected ubuntu, got %q", got)
+	}
+}
+
+func TestParseDistroIDFallback(t *testing.T) {
+	if got := parseDistroID(""); got != "linux" {
+		t.Errorf("expected linux fallback, got %q", got)
+	}
+}
+
+func TestParseDistroVersion(t *testing.T) {
+	content := `NAME="Ubuntu"
+VERSION_ID="22.04"
+`
+	if got := parseDistroVersion(content); got != "22.04" {
+		t.Errorf("expected 22.04, got %q", got)
+	}
+}
+
+func TestParseDistroVersionQuotes(t *testing.T) {
+	content := `VERSION_ID="39"`
+	if got := parseDistroVersion(content); got != "39" {
+		t.Errorf("expected 39, got %q", got)
+	}
+}

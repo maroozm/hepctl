@@ -9,15 +9,33 @@ import (
 // DistroName returns the Linux distribution name by parsing /etc/os-release.
 // Falls back to "Linux" if the file is missing or the NAME field is absent.
 func DistroName() string {
-	return distroNameFromFile("/etc/os-release")
-}
-
-func distroNameFromFile(path string) string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return "Linux"
 	}
 	return parseDistroName(string(data))
+}
+
+// DistroID returns the ID from /etc/os-release (e.g. "ubuntu", "fedora").
+// Returns "linux" if unavailable.
+func DistroID() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return "linux"
+	}
+	return parseDistroID(string(data))
+}
+
+func parseDistroID(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ID=") {
+			val := strings.TrimPrefix(line, "ID=")
+			val = strings.Trim(val, `"`)
+			return strings.TrimSpace(val)
+		}
+	}
+	return "linux"
 }
 
 // parseDistroName extracts the NAME field from os-release content.
@@ -34,6 +52,28 @@ func parseDistroName(content string) string {
 		}
 	}
 	return "Linux"
+}
+
+// DistroVersion returns the VERSION_ID from /etc/os-release (e.g. "24.04").
+// Returns "" if unavailable.
+func DistroVersion() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	return parseDistroVersion(string(data))
+}
+
+func parseDistroVersion(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "VERSION_ID=") {
+			val := strings.TrimPrefix(line, "VERSION_ID=")
+			val = strings.Trim(val, `"`)
+			return strings.TrimSpace(val)
+		}
+	}
+	return ""
 }
 
 // knownManagers is the ordered list of package managers to probe for.

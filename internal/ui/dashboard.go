@@ -43,6 +43,11 @@ type installEvent struct {
 
 type installEventMsg installEvent
 
+// installResultMsg indicates the result of an extraction/install operation.
+type installResultMsg struct {
+	err error
+}
+
 type sudoResultMsg struct {
 	err error
 }
@@ -51,6 +56,21 @@ type versionsFetchedMsg struct {
 	versions []install.ROOTVersion
 	err      error
 }
+
+type assetFoundMsg struct {
+	url      string
+	filename string
+}
+
+type downloadEvent struct {
+	filename   string
+	downloaded int64
+	total      int64
+	done       bool
+	err        error
+}
+
+type downloadEventMsg downloadEvent
 
 type tickMsg struct{}
 
@@ -84,6 +104,10 @@ type dashboardModel struct {
 	versionCursor       int
 	versionFetching     bool
 	selectedROOTVersion string
+
+	downloading      bool
+	downloadProgress float64
+	downloadEvents   chan downloadEvent
 
 	running bool
 	spin    int
@@ -171,6 +195,42 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusError = false
 		m.logs = append(m.logs, "[ok] fetched "+fmt.Sprintf("%d", len(typed.versions))+" versions")
 		return m, nil
+	case assetFoundMsg:
+		m.status = "Downloading " + typed.filename + "..."
+		m.statusError = false
+		m.logs = append(m.logs, "[ok] found asset: "+typed.filename)
+		m.downloading = true
+		m.downloadEvents = make(chan downloadEvent, 256)
+		return m, startDownload(typed.url, typed.filename, m.downloadEvents)
+	case downloadEventMsg:
+		ev := downloadEvent(typed)
+		if ev.done {
+			m.downloading = false
+			if ev.err != nil {
+				m.status = "Download failed: " + ev.err.Error()
+				m.statusError = true
+				m.logs = append(m.logs, "[error] download failed: "+ev.err.Error())
+				m.downloadEvents = nil
+				return m, nil
+			}
+			m.status = "Download complete. Extracting to ~/.local/..."
+			m.statusError = false
+			m.logs = append(m.logs, "[ok] downloaded to "+ev.filename)
+
+			// Trigger extraction.
+			home, _ := os.UserHomeDir() // unlikely to fail if download succeeded
+			tarballPath := filepath.Join(os.TempDir(), ev.filename)
+			destParent := filepath.Join(home, ".local")
+
+			return m, extractCmd(tarballPath, destParent)
+		}
+		if ev.total > 0 {
+			m.downloadProgress = float64(ev.downloaded) / float64(ev.total)
+			m.status = fmt.Sprintf("Downloading %s... %.0f%%", ev.filename, m.downloadProgress*100)
+		}
+		if m.downloadEvents != nil {
+			return m, waitForDownloadEvent(m.downloadEvents)
+		}
 	case installEventMsg:
 		ev := installEvent(typed)
 		if ev.line != "" {
@@ -194,6 +254,28 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.events != nil {
 			return m, waitForInstallEvent(m.events)
 		}
+	case installResultMsg:
+		if typed.err != nil {
+			m.status = "Extraction failed: " + typed.err.Error()
+			m.statusError = true
+			m.logs = append(m.logs, "[error] extraction failed: "+typed.err.Error())
+		} else {
+			m.logs = append(m.logs, "[ok] extracted ROOT to ~/.local/ROOT")
+
+			// Configure shell environment.
+			shell := platform.DetectShell()
+			rcFile, err := platform.ConfigureShell(shell)
+			if err != nil {
+				m.status = fmt.Sprintf("ROOT installed, but shell config failed: %s", err.Error())
+				m.statusError = true // Warning, not fatal for install
+				m.logs = append(m.logs, "[warn] shell config failed: "+err.Error())
+			} else {
+				m.status = fmt.Sprintf("ROOT installed! Source added to %s", rcFile)
+				m.statusError = false
+				m.logs = append(m.logs, "[ok] configured "+shell+" in "+rcFile)
+			}
+		}
+		return m, nil
 	case tea.KeyMsg:
 		// Version selection mode: intercept keys.
 		if m.versionSelectMode {
@@ -211,9 +293,10 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.versionSelectMode = false
 				m.selectedROOTVersion = selected.Version
 				m.availableVersions = nil
-				m.status = "Selected ROOT " + selected.Version + ". (Install step coming soon.)"
+				m.status = "Finding compatible ROOT asset..."
 				m.statusError = false
 				m.logs = append(m.logs, "[ok] selected ROOT "+selected.Version)
+				return m, findAssetCmd(selected.Tag)
 			case "esc", "ctrl+c":
 				m.versionSelectMode = false
 				m.availableVersions = nil
@@ -1042,4 +1125,65 @@ func (w *eventWriter) Flush() {
 		w.emit(remaining)
 	}
 	w.buf.Reset()
+}
+
+// findAssetCmd searches for a compatible ROOT asset for the current distro.
+func findAssetCmd(tag string) tea.Cmd {
+	return func() tea.Msg {
+		distro := platform.DistroID()
+		ver := platform.DistroVersion()
+		url, filename, err := install.FindDistroAsset(tag, distro, ver)
+		if err != nil {
+			return downloadEventMsg{
+				done: true,
+				err:  fmt.Errorf("finding asset for %s %s: %w", distro, ver, err),
+			}
+		}
+		return assetFoundMsg{url: url, filename: filename}
+	}
+}
+
+func startDownload(url, filename string, events chan downloadEvent) tea.Cmd {
+	go runDownload(url, filename, events)
+	return waitForDownloadEvent(events)
+}
+
+func runDownload(url, filename string, events chan<- downloadEvent) {
+	// Send initial event
+	events <- downloadEvent{filename: filename, total: -1}
+
+	// Download to system temp directory (e.g. /tmp/root_v6....tar.gz).
+	destPath := filepath.Join(os.TempDir(), filename)
+
+	err := install.DownloadROOTAsset(url, destPath, func(current, total int64) {
+		events <- downloadEvent{
+			filename:   filename,
+			downloaded: current,
+			total:      total,
+		}
+	})
+
+	events <- downloadEvent{
+		filename: filename,
+		done:     true,
+		err:      err,
+	}
+}
+
+func waitForDownloadEvent(events chan downloadEvent) tea.Cmd {
+	if events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return downloadEventMsg(<-events)
+	}
+}
+
+func extractCmd(tarballPath, destParent string) tea.Cmd {
+	return func() tea.Msg {
+		err := install.ExtractROOT(tarballPath, destParent)
+		// Cleanup tarball regardless of success/failure
+		_ = os.Remove(tarballPath)
+		return installResultMsg{err: err}
+	}
 }
