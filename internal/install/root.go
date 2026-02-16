@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"hepctl/internal/platform"
 )
 
 const homebrewInstallCommand = `$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)`
@@ -97,13 +99,60 @@ func (i *RootInstaller) Install(ctx context.Context) error {
 	case "darwin":
 		return i.installOnMacOS(ctx)
 	case "linux":
-		if isUbuntu() {
-			return errors.New("ubuntu support is planned but not implemented yet")
-		}
-		return errors.New("linux detected, but only ubuntu is in scope for the next step")
+		return i.installOnLinux(ctx)
 	default:
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
+}
+
+// linuxManagerInfo maps a package manager binary to the install arguments for ROOT.
+type linuxManagerInfo struct {
+	bin     string   // binary name (e.g. "pacman")
+	args    []string // arguments after "sudo <bin>" (e.g. ["-S", "root"])
+	pkgName string   // human-friendly label for logging
+}
+
+// ErrNeedsVersionSelection signals the caller (the TUI) that this distro
+// requires the user to pick a ROOT version before installation can proceed.
+var ErrNeedsVersionSelection = errors.New("version selection required")
+
+// distrosNeedingVersionSelect lists distros where ROOT is not in the system repos.
+var distrosNeedingVersionSelect = []string{"ubuntu", "debian", "linuxmint"}
+
+// DistrosNeedingVersionSelect returns the list of distros that require
+// manual ROOT version selection.
+func DistrosNeedingVersionSelect() []string {
+	return distrosNeedingVersionSelect
+}
+
+var linuxManagers = []linuxManagerInfo{
+	{bin: "pacman", args: []string{"-S", "--noconfirm", "root"}, pkgName: "pacman"},
+	{bin: "dnf", args: []string{"install", "-y", "root"}, pkgName: "dnf"},
+	{bin: "yum", args: []string{"install", "-y", "root"}, pkgName: "yum"},
+	{bin: "zypper", args: []string{"install", "-y", "root"}, pkgName: "zypper"},
+	{bin: "eopkg", args: []string{"install", "-y", "root"}, pkgName: "eopkg"},
+}
+
+func (i *RootInstaller) installOnLinux(ctx context.Context) error {
+	// Check if this distro needs manual version selection (ROOT not in repos).
+	for _, d := range distrosNeedingVersionSelect {
+		if platform.IsDistro(d) {
+			return ErrNeedsVersionSelection
+		}
+	}
+
+	mgr := platform.PackageManager()
+
+	for _, m := range linuxManagers {
+		if m.bin == mgr {
+			cmdArgs := append([]string{m.bin}, m.args...)
+			fmt.Fprintf(i.out, "Detected %s. Installing ROOT with: sudo %s\n", m.pkgName, strings.Join(cmdArgs, " "))
+			return i.runner.Run(ctx, "sudo", cmdArgs...)
+		}
+	}
+
+	distro := platform.DistroName()
+	return fmt.Errorf("no supported package manager found on %s; detected manager: %s", distro, mgr)
 }
 
 func (i *RootInstaller) installOnMacOS(ctx context.Context) error {
@@ -191,14 +240,4 @@ func (i *RootInstaller) resolveBrewPath() (string, error) {
 	}
 
 	return "", errors.New("homebrew installed but `brew` was not found in PATH; rerun your shell and try again")
-}
-
-func isUbuntu() bool {
-	data, err := os.ReadFile("/etc/os-release")
-	if err != nil {
-		return false
-	}
-
-	lower := strings.ToLower(string(data))
-	return strings.Contains(lower, "id=ubuntu") || strings.Contains(lower, "id_like=ubuntu")
 }

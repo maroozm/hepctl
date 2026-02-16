@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"unicode"
 
 	"hepctl/internal/install"
+	"hepctl/internal/platform"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -41,6 +43,15 @@ type installEvent struct {
 
 type installEventMsg installEvent
 
+type sudoResultMsg struct {
+	err error
+}
+
+type versionsFetchedMsg struct {
+	versions []install.ROOTVersion
+	err      error
+}
+
 type tickMsg struct{}
 
 type dashboardModel struct {
@@ -64,6 +75,15 @@ type dashboardModel struct {
 
 	awaitingManager bool
 	selectedManager install.ManagerChoice
+
+	passwordMode  bool
+	passwordInput []rune
+
+	versionSelectMode   bool
+	availableVersions   []install.ROOTVersion
+	versionCursor       int
+	versionFetching     bool
+	selectedROOTVersion string
 
 	running bool
 	spin    int
@@ -121,6 +141,36 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spin = (m.spin + 1) % 4
 			return m, tickCmd()
 		}
+	case sudoResultMsg:
+		if typed.err != nil {
+			m.status = "Authentication failed. Try again with `install root`."
+			m.statusError = true
+			return m, nil
+		}
+		m.status = "Authenticated. Starting ROOT installation..."
+		m.statusError = false
+		m.logs = append(m.logs, "[ok] sudo credentials cached")
+		return m, m.startInstallRoot()
+	case versionsFetchedMsg:
+		m.versionFetching = false
+		if typed.err != nil {
+			m.status = "Failed to fetch versions: " + typed.err.Error()
+			m.statusError = true
+			m.logs = append(m.logs, "[error] "+typed.err.Error())
+			return m, nil
+		}
+		if len(typed.versions) == 0 {
+			m.status = "No ROOT versions found."
+			m.statusError = true
+			return m, nil
+		}
+		m.availableVersions = typed.versions
+		m.versionCursor = 0
+		m.versionSelectMode = true
+		m.status = "Select a ROOT version."
+		m.statusError = false
+		m.logs = append(m.logs, "[ok] fetched "+fmt.Sprintf("%d", len(typed.versions))+" versions")
+		return m, nil
 	case installEventMsg:
 		ev := installEvent(typed)
 		if ev.line != "" {
@@ -145,6 +195,69 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, waitForInstallEvent(m.events)
 		}
 	case tea.KeyMsg:
+		// Version selection mode: intercept keys.
+		if m.versionSelectMode {
+			switch typed.String() {
+			case "up", "k":
+				if m.versionCursor > 0 {
+					m.versionCursor--
+				}
+			case "down", "j":
+				if m.versionCursor < len(m.availableVersions)-1 {
+					m.versionCursor++
+				}
+			case "enter":
+				selected := m.availableVersions[m.versionCursor]
+				m.versionSelectMode = false
+				m.selectedROOTVersion = selected.Version
+				m.availableVersions = nil
+				m.status = "Selected ROOT " + selected.Version + ". (Install step coming soon.)"
+				m.statusError = false
+				m.logs = append(m.logs, "[ok] selected ROOT "+selected.Version)
+			case "esc", "ctrl+c":
+				m.versionSelectMode = false
+				m.availableVersions = nil
+				m.status = "Version selection canceled."
+				m.statusError = false
+			}
+			return m, nil
+		}
+
+		// Password mode: handle input separately.
+		if m.passwordMode {
+			switch typed.String() {
+			case "enter":
+				password := string(m.passwordInput)
+				// Clear password from model immediately.
+				for i := range m.passwordInput {
+					m.passwordInput[i] = 0
+				}
+				m.passwordInput = nil
+				m.passwordMode = false
+				m.status = "Authenticating..."
+				m.statusError = false
+				return m, trySudoAuth(password)
+			case "esc", "ctrl+c":
+				for i := range m.passwordInput {
+					m.passwordInput[i] = 0
+				}
+				m.passwordInput = nil
+				m.passwordMode = false
+				m.status = "Password entry canceled."
+				m.statusError = false
+				return m, nil
+			case "backspace":
+				if len(m.passwordInput) > 0 {
+					m.passwordInput = m.passwordInput[:len(m.passwordInput)-1]
+				}
+			default:
+				if len(typed.Runes) > 0 {
+					m.passwordInput = append(m.passwordInput, typed.Runes...)
+				}
+			}
+			return m, nil
+		}
+
 		suggestions := m.installSuggestions()
 		switch typed.String() {
 		case "left":
@@ -298,6 +411,25 @@ func (m *dashboardModel) handleCommand(raw string) tea.Cmd {
 				return nil
 			}
 		}
+		// On Ubuntu/Debian, ROOT isn't in the repos — offer version selection.
+		if runtime.GOOS == "linux" && needsVersionSelection() {
+			m.versionFetching = true
+			m.status = "Fetching available ROOT versions..."
+			m.statusError = false
+			m.logs = append(m.logs, "$ fetching root.cern releases...")
+			return fetchVersionsCmd()
+		}
+		// On Linux, install commands use sudo. Pre-authenticate if needed.
+		if runtime.GOOS == "linux" {
+			if needsSudoAuth() {
+				m.selectedManager = install.ManagerAuto
+				m.passwordMode = true
+				m.passwordInput = nil
+				m.status = "Enter sudo password to continue."
+				m.statusError = false
+				return nil
+			}
+		}
 		m.selectedManager = install.ManagerAuto
 		m.status = "Starting ROOT installation..."
 		m.statusError = false
@@ -429,7 +561,17 @@ func (m dashboardModel) View() string {
 	hint := muted.Render("try: ") +
 		lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render("install root") +
 		muted.Render(" | help | quit")
-	if m.awaitingManager {
+	if m.versionSelectMode {
+		hint = lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render("↑/↓ or j/k") +
+			muted.Render(" to move, ") +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render("Enter") +
+			muted.Render(" to select, ") +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render("Esc") +
+			muted.Render(" to cancel")
+	} else if m.passwordMode {
+		hint = lipgloss.NewStyle().Foreground(lipgloss.Color("#F2C85B")).Render("🔒 ") +
+			muted.Render("Enter to submit, Esc to cancel")
+	} else if m.awaitingManager {
 		hint = muted.Render("choose manager: ") +
 			lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render("brew") +
 			muted.Render(" | ") +
@@ -490,6 +632,11 @@ func (m dashboardModel) View() string {
 }
 
 func (m dashboardModel) renderActivity(width int) string {
+	// Version selection mode: render the version picker instead of logs.
+	if m.versionSelectMode && len(m.availableVersions) > 0 {
+		return m.renderVersionPicker(width)
+	}
+
 	head := lipgloss.NewStyle().Foreground(lipgloss.Color("#D8E1FF")).Bold(true).Render("activity")
 	lines := []string{head}
 
@@ -505,8 +652,55 @@ func (m dashboardModel) renderActivity(width int) string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#5F6C95")).Render("No activity yet."))
 	} else {
 		logStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9EA9CE")).MaxWidth(width)
+		okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).MaxWidth(width)
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1")).MaxWidth(width)
 		for _, line := range m.logs {
-			lines = append(lines, logStyle.Render(line))
+			switch {
+			case strings.HasPrefix(line, "[ok]"):
+				lines = append(lines, okStyle.Render(line))
+			case strings.HasPrefix(line, "[error]"):
+				lines = append(lines, errStyle.Render(line))
+			default:
+				lines = append(lines, logStyle.Render(line))
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m dashboardModel) renderVersionPicker(_ int) string {
+	head := lipgloss.NewStyle().Foreground(lipgloss.Color("#D8E1FF")).Bold(true).Render("Select ROOT version")
+	lines := []string{head, ""}
+
+	normal := lipgloss.NewStyle().Foreground(lipgloss.Color("#9EA9CE"))
+	active := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#0B1020")).
+		Background(lipgloss.Color("#B6C3F2")).
+		Bold(true).
+		Padding(0, 1)
+	latestBadge := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#0B1020")).
+		Background(lipgloss.Color("#7DCEA0")).
+		Bold(true).
+		Padding(0, 1)
+	dateMuted := lipgloss.NewStyle().Foreground(lipgloss.Color("#66739A"))
+
+	for idx, ver := range m.availableVersions {
+		label := ver.Version
+		dateStr := ""
+		if ver.Date != "" {
+			dateStr = dateMuted.Render("  " + ver.Date)
+		}
+		badge := ""
+		if ver.IsLatest {
+			badge = " " + latestBadge.Render("latest")
+		}
+
+		if idx == m.versionCursor {
+			lines = append(lines, "  "+active.Render("> "+label)+badge+dateStr)
+		} else {
+			lines = append(lines, "  "+normal.Render("  "+label)+badge+dateStr)
 		}
 	}
 
@@ -514,6 +708,14 @@ func (m dashboardModel) renderActivity(width int) string {
 }
 
 func (m dashboardModel) renderInputLine() string {
+	if m.versionSelectMode {
+		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color("#8FA1D6")).Render("> ")
+		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("#5F6C95")).Render("select a ROOT version above...")
+		return prefix + placeholder
+	}
+	if m.passwordMode {
+		return m.renderPasswordLine()
+	}
 	if m.running {
 		prefix := lipgloss.NewStyle().Foreground(lipgloss.Color("#8FA1D6")).Render("> ")
 		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("#5F6C95")).Render("installation in progress...")
@@ -549,6 +751,37 @@ func (m dashboardModel) renderInputLine() string {
 	}
 
 	return prefix + left + cursor + right
+}
+
+func (m dashboardModel) renderPasswordLine() string {
+	lockIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#F2C85B")).Render("🔒 ")
+	label := lipgloss.NewStyle().Foreground(lipgloss.Color("#D8E1FF")).Bold(true).Render("sudo password: ")
+
+	masked := strings.Repeat("•", len(m.passwordInput))
+	maskedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#B6C3F2")).Render(masked)
+
+	cursor := lipgloss.NewStyle().
+		Background(lipgloss.Color("#D8E1FF")).
+		Foreground(lipgloss.Color("#0B1020")).
+		Render(" ")
+
+	return lockIcon + label + maskedStyle + cursor
+}
+
+// trySudoAuth validates the password using "sudo -S -v" (reads password from stdin).
+// Returns a tea.Cmd that runs asynchronously and produces a sudoResultMsg.
+func trySudoAuth(password string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("sudo", "-S", "-v")
+		cmd.Stdin = strings.NewReader(password + "\n")
+		err := cmd.Run()
+		// Zero out the password string's backing bytes (best-effort).
+		pw := []byte(password)
+		for i := range pw {
+			pw[i] = 0
+		}
+		return sudoResultMsg{err: err}
+	}
 }
 
 func insertAt(base []rune, pos int, chunk []rune) []rune {
@@ -662,28 +895,61 @@ func platformLabel() string {
 	case "darwin":
 		return "macOS"
 	case "linux":
-		return "Linux"
+		distro := platform.DistroName()
+		return distro + " (Linux)"
 	default:
 		return runtime.GOOS
 	}
 }
 
-func detectManagerState() string {
-	if runtime.GOOS != "darwin" {
-		return "ubuntu pending"
-	}
+// needsSudoAuth reports whether sudo credentials need to be (re-)authenticated.
+// It runs "sudo -n true" which succeeds silently if credentials are cached.
+func needsSudoAuth() bool {
+	return exec.Command("sudo", "-n", "true").Run() != nil
+}
 
-	probe := install.NewRootInstaller(install.DefaultRunner{}, nil, io.Discard)
-	detected := probe.DetectMacManagers()
-	switch {
-	case detected.BrewExists && detected.PortExists:
-		return "brew + port"
-	case detected.BrewExists:
-		return "brew"
-	case detected.PortExists:
-		return "port"
+// needsVersionSelection reports whether the current Linux distro requires
+// manual ROOT version selection (i.e. ROOT is not in the distro's repos).
+func needsVersionSelection() bool {
+	for _, d := range install.DistrosNeedingVersionSelect() {
+		if platform.IsDistro(d) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchVersionsCmd returns a tea.Cmd that fetches ROOT versions in the background.
+func fetchVersionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		versions, err := install.FetchROOTVersions()
+		return versionsFetchedMsg{versions: versions, err: err}
+	}
+}
+
+func detectManagerState() string {
+	switch runtime.GOOS {
+	case "linux":
+		mgr := platform.PackageManager()
+		if mgr == "unknown" {
+			return "none detected"
+		}
+		return mgr
+	case "darwin":
+		probe := install.NewRootInstaller(install.DefaultRunner{}, nil, io.Discard)
+		detected := probe.DetectMacManagers()
+		switch {
+		case detected.BrewExists && detected.PortExists:
+			return "brew + port"
+		case detected.BrewExists:
+			return "brew"
+		case detected.PortExists:
+			return "port"
+		default:
+			return "none (will install brew)"
+		}
 	default:
-		return "none (will install brew)"
+		return "unsupported"
 	}
 }
 
