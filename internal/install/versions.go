@@ -29,7 +29,7 @@ func (v ROOTVersion) String() string {
 		s += " (" + v.Date + ")"
 	}
 	if v.IsLatest {
-		s = s + " [latest]"
+		s = s + " [latest] (recommended)"
 	}
 	return s
 }

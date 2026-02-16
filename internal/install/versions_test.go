@@ -64,7 +64,7 @@ func TestParseDisplayDate(t *testing.T) {
 func TestROOTVersionString(t *testing.T) {
 	v := ROOTVersion{Version: "6.36.08", Date: "05 Feb 2026", IsLatest: true}
 	s := v.String()
-	if s != "6.36.08 (05 Feb 2026) [latest]" {
+	if s != "6.36.08 (05 Feb 2026) [latest] (recommended)" {
 		t.Fatalf("unexpected string: %q", s)
 	}
 
