@@ -1,15 +1,19 @@
 package install
 
 import (
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-const releasesURL = "https://root.cern/install/all_releases/"
+const (
+	// GitHub API endpoint for ROOT releases (paginated, newest first).
+	ghReleasesURL = "https://api.github.com/repos/root-project/root/releases?per_page=100"
+	// GitHub API endpoint for the release tagged "latest".
+	ghLatestURL = "https://api.github.com/repos/root-project/root/releases/latest"
+)
 
 // ROOTVersion represents a single ROOT release.
 type ROOTVersion struct {
@@ -30,145 +34,146 @@ func (v ROOTVersion) String() string {
 	return s
 }
 
-// releasePattern matches lines like:
-//
-//	Release 6.36.08 - 06 Feb 2026
-//	Release 6.30/02 - 28 Nov 2023
-var releasePattern = regexp.MustCompile(
-	`Release\s+(\d+\.\d+[./]\d+)\s*-\s*(\d{1,2}\s+\w+\s+\d{4})`,
-)
+// ghRelease is the subset of fields we need from the GitHub API response.
+type ghRelease struct {
+	TagName     string `json:"tag_name"`
+	PublishedAt string `json:"published_at"`
+	Prerelease  bool   `json:"prerelease"`
+	Draft       bool   `json:"draft"`
+}
 
-// latestPattern matches the "LATEST STABLE" link text that precedes the
-// latest release on the page.
-var latestPattern = regexp.MustCompile(
-	`LATEST STABLE.*?Release\s+(\d+\.\d+[./]\d+)`,
-)
-
-// FetchROOTVersions scrapes the root.cern releases page and returns available
-// stable ROOT versions, newest first. Release candidates (rc) are excluded.
+// FetchROOTVersions fetches available ROOT versions from the GitHub releases
+// API. Returns stable versions released within 8 months of the latest, newest
+// first. The version marked "latest" on GitHub is flagged with IsLatest.
 func FetchROOTVersions() ([]ROOTVersion, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	resp, err := client.Get(releasesURL)
+	// 1. Get the tag marked as "latest" on GitHub.
+	latestTag, err := fetchLatestTag(client)
 	if err != nil {
-		return nil, fmt.Errorf("fetching releases page: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("releases page returned status %d", resp.StatusCode)
+		return nil, err
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 2. Get all releases.
+	releases, err := fetchAllReleases(client)
 	if err != nil {
-		return nil, fmt.Errorf("reading releases page: %w", err)
+		return nil, err
 	}
 
-	return ParseROOTVersions(string(body))
-}
-
-// ParseROOTVersions extracts ROOT versions from the HTML/text content of the
-// releases page. Exported so it can be tested with canned input.
-// Only versions released within the last 8 months of the newest release are kept.
-func ParseROOTVersions(content string) ([]ROOTVersion, error) {
-	// Find the latest version label.
-	latestVer := ""
-	if m := latestPattern.FindStringSubmatch(content); len(m) >= 2 {
-		latestVer = normalizeVersion(m[1])
-	}
-
-	matches := releasePattern.FindAllStringSubmatch(content, -1)
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("no releases found on page")
-	}
-
-	// Deduplicate: the page often lists the same version in multiple sections.
-	seen := make(map[string]bool)
+	// 3. Convert to ROOTVersion, applying filters.
+	latestVer := tagToVersion(latestTag)
 	var versions []ROOTVersion
+	var newest time.Time
 
-	for _, m := range matches {
-		ver := normalizeVersion(m[1])
-		date := m[2]
-
-		// Skip release candidates.
-		if strings.Contains(strings.ToLower(ver), "rc") {
+	for _, r := range releases {
+		if r.Draft || r.Prerelease {
+			continue
+		}
+		ver := tagToVersion(r.TagName)
+		if ver == "" {
+			continue
+		}
+		// Skip release candidates (tag might not set prerelease flag).
+		if strings.Contains(strings.ToLower(r.TagName), "rc") {
 			continue
 		}
 
-		if seen[ver] {
-			continue
+		pubDate, _ := time.Parse(time.RFC3339, r.PublishedAt)
+		if pubDate.After(newest) {
+			newest = pubDate
 		}
-		seen[ver] = true
 
 		versions = append(versions, ROOTVersion{
 			Version:  ver,
-			Date:     date,
+			Date:     formatDate(pubDate),
 			IsLatest: ver == latestVer,
 		})
 	}
 
 	if len(versions) == 0 {
-		return nil, fmt.Errorf("no stable releases found")
+		return nil, fmt.Errorf("no stable ROOT releases found")
 	}
 
-	// Filter: keep only versions within 8 months of the newest release date.
-	versions = filterByAge(versions, 8)
+	// 4. Apply 8-month cutoff from the newest release.
+	if !newest.IsZero() {
+		cutoff := newest.AddDate(0, -8, 0)
+		var filtered []ROOTVersion
+		for _, v := range versions {
+			t, ok := parseDisplayDate(v.Date)
+			if !ok || !t.Before(cutoff) {
+				filtered = append(filtered, v)
+			}
+		}
+		versions = filtered
+	}
 
 	return versions, nil
 }
 
-// dateLayouts are the formats the releases page uses for dates.
-var dateLayouts = []string{
-	"2 January 2006",
-	"02 January 2006",
-	"2 Jan 2006",
-	"02 Jan 2006",
+// fetchLatestTag returns the tag_name of the release flagged as "latest".
+func fetchLatestTag(client *http.Client) (string, error) {
+	req, _ := http.NewRequest("GET", ghLatestURL, nil)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetching latest release: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub latest release returned status %d", resp.StatusCode)
+	}
+
+	var r ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return "", fmt.Errorf("decoding latest release: %w", err)
+	}
+	return r.TagName, nil
 }
 
-// parseReleaseDate attempts to parse a date string like "06 Feb 2026".
-func parseReleaseDate(s string) (time.Time, bool) {
-	s = strings.TrimSpace(s)
-	for _, layout := range dateLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, true
-		}
+// fetchAllReleases returns all releases from the GitHub API (up to 100).
+func fetchAllReleases(client *http.Client) ([]ghRelease, error) {
+	req, _ := http.NewRequest("GET", ghReleasesURL, nil)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching releases: %w", err)
 	}
-	return time.Time{}, false
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub releases returned status %d", resp.StatusCode)
+	}
+
+	var releases []ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("decoding releases: %w", err)
+	}
+	return releases, nil
 }
 
-// filterByAge keeps only versions whose release date is within `months`
-// months of the newest release. Versions with unparseable dates are kept.
-func filterByAge(versions []ROOTVersion, months int) []ROOTVersion {
-	// Find the newest date.
-	var newest time.Time
-	for _, v := range versions {
-		if t, ok := parseReleaseDate(v.Date); ok {
-			if t.After(newest) {
-				newest = t
-			}
-		}
+// tagToVersion converts a GitHub tag like "v6-36-08" to "6.36.08".
+// Returns "" for tags that don't match the expected pattern.
+func tagToVersion(tag string) string {
+	t := strings.TrimPrefix(tag, "v")
+	if t == tag {
+		return "" // no "v" prefix, not a version tag
 	}
-	if newest.IsZero() {
-		return versions // can't determine cutoff, keep all
-	}
-
-	cutoff := newest.AddDate(0, -months, 0)
-
-	var filtered []ROOTVersion
-	for _, v := range versions {
-		t, ok := parseReleaseDate(v.Date)
-		if !ok {
-			filtered = append(filtered, v) // keep unparseable dates
-			continue
-		}
-		if !t.Before(cutoff) {
-			filtered = append(filtered, v)
-		}
-	}
-	return filtered
+	return strings.ReplaceAll(t, "-", ".")
 }
 
-// normalizeVersion replaces 6.30/02 style with 6.30.02.
-func normalizeVersion(v string) string {
-	return strings.ReplaceAll(v, "/", ".")
+// formatDate formats a time.Time to "02 Jan 2006" for display.
+func formatDate(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("02 Jan 2006")
+}
+
+// parseDisplayDate parses a date string formatted by formatDate.
+func parseDisplayDate(s string) (time.Time, bool) {
+	t, err := time.Parse("02 Jan 2006", s)
+	return t, err == nil
 }
