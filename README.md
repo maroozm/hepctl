@@ -20,11 +20,11 @@ go run ./cmd/hepct
 
 ## Package checklist
 
-| Package | Ubuntu | macOS |
-| ------- | ------ | ----- |
-| ROOT    | [ ]    | [x]   |
-| PYTHIA  | [ ]    | [ ]   |
-| AMPT    | [ ]    | [ ]   |
-| HIJING  | [ ]    | [ ]   |
-| RIVET   | [ ]    | [ ]   |
-| EPOS4   | [ ]    | [ ]   |
+| Package | Issue | Status | Ubuntu | macOS |
+| ------- | ----- | ------ | ------ | ----- |
+| ROOT    | -     | 🟢 supported | [ ]    | [x]   |
+| PYTHIA  | -     | 🔴 not supported | [ ]    | [ ]   |
+| AMPT    | [#3](https://github.com/maroozm/hepctl/issues/3) | 🔴 not supported | [ ]    | [ ]   |
+| HIJING  | -     | 🔴 not supported | [ ]    | [ ]   |
+| RIVET   | -     | 🔴 not supported | [ ]    | [ ]   |
+| EPOS4   | -     | 🔴 not supported | [ ]    | [ ]   |
